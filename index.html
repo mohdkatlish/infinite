@@ -7,7 +7,7 @@
 <style>
   *,*::after,*::before{box-sizing:border-box}
   html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;font-family:ui-monospace,monospace;-webkit-font-smoothing:antialiased}
-  body{background:#000;color:#fff}
+  body{background:#ffffff;color:#fff}
 
   #canvas-container{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:grab}
   #canvas-container.dragging{cursor:grabbing}
@@ -39,26 +39,56 @@
 (function() {
   'use strict';
 
-  // ─── CONFIG ──────────────────────────────────────────────────
-  // Replace with your own image URLs (must support CORS).
-  // For Tiklam: use episode thumbnails hosted on a CDN or Webflow assets.
-  var MEDIA_MANIFEST = [
-    { url: "https://picsum.photos/seed/tiklam1/512/340", width: 512, height: 340 },
-    { url: "https://picsum.photos/seed/tiklam2/512/680", width: 512, height: 680 },
-    { url: "https://picsum.photos/seed/tiklam3/512/340", width: 512, height: 340 },
-    { url: "https://picsum.photos/seed/tiklam4/512/512", width: 512, height: 512 },
-    { url: "https://picsum.photos/seed/tiklam5/512/340", width: 512, height: 340 },
-    { url: "https://picsum.photos/seed/tiklam6/512/768", width: 512, height: 768 },
-    { url: "https://picsum.photos/seed/tiklam7/512/340", width: 512, height: 340 },
-    { url: "https://picsum.photos/seed/tiklam8/512/512", width: 512, height: 512 },
-    { url: "https://picsum.photos/seed/tiklam9/512/340", width: 512, height: 340 },
-    { url: "https://picsum.photos/seed/tiklam10/512/680", width: 512, height: 680 },
-    { url: "https://picsum.photos/seed/tiklam11/512/340", width: 512, height: 340 },
-    { url: "https://picsum.photos/seed/tiklam12/512/512", width: 512, height: 512 },
-    { url: "https://picsum.photos/seed/tiklam13/512/340", width: 512, height: 340 },
-    { url: "https://picsum.photos/seed/tiklam14/512/768", width: 512, height: 768 },
-    { url: "https://picsum.photos/seed/tiklam15/512/340", width: 512, height: 340 },
+  // ════════════════════════════════════════════════════════════
+  //  IMAGE CONFIGURATION
+  //  Default images shown when no CMS images are received.
+  //  These are replaced automatically when embedded in Webflow
+  //  via postMessage from the parent page.
+  //
+  //  To edit manually: just add/remove URLs below.
+  //  Images must support CORS (Unsplash, Cloudinary, same-origin).
+  // ════════════════════════════════════════════════════════════
+  var DEFAULT_IMAGES = [
+    "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=512&q=80",
+    "https://images.unsplash.com/photo-1506748686214-e9df14d4d9d0?w=512&q=80",
+    "https://images.unsplash.com/photo-1519681393784-d120267933ba?w=512&q=80",
+    "https://images.unsplash.com/photo-1470071459604-3b5ec3a7fe05?w=512&q=80",
+    "https://images.unsplash.com/photo-1441974231531-c6227db76b6e?w=512&q=80",
+    "https://images.unsplash.com/photo-1518173946687-a2e4c8b6e86c?w=512&q=80",
+    "https://images.unsplash.com/photo-1475924156734-496f6cac6ec1?w=512&q=80",
+    "https://images.unsplash.com/photo-1501785888041-af3ef285b470?w=512&q=80",
+    "https://images.unsplash.com/photo-1472214103451-9374bd1c798e?w=512&q=80",
+    "https://images.unsplash.com/photo-1465146344425-f00d5f5c8f07?w=512&q=80",
+    "https://images.unsplash.com/photo-1493246507139-91e8fad9978e?w=512&q=80",
+    "https://images.unsplash.com/photo-1500534314209-a25ddb2bd429?w=512&q=80",
   ];
+
+  // Build manifest from URLs (auto-assumes 3:2 aspect ratio)
+  function buildManifest(urls) {
+    return urls.map(function(entry) {
+      if (typeof entry === 'string') return { url: entry, width: 512, height: 341 };
+      return { url: entry.url, width: entry.width || 512, height: entry.height || 512 };
+    });
+  }
+
+  var MEDIA_MANIFEST = buildManifest(DEFAULT_IMAGES);
+
+  // ─── CMS IMAGE INTEGRATION (via postMessage) ─────────────────
+  // Webflow parent sends: { type: 'update-images', images: ['url1', ...] }
+  // If no message received within 3s, default images are used.
+  var cmsReceived = false;
+
+  window.addEventListener('message', function(e) {
+    if (e.data && e.data.type === 'update-images' && Array.isArray(e.data.images) && e.data.images.length > 0) {
+      cmsReceived = true;
+      MEDIA_MANIFEST.length = 0;
+      var newManifest = buildManifest(e.data.images);
+      for (var i = 0; i < newManifest.length; i++) {
+        MEDIA_MANIFEST.push(newManifest[i]);
+      }
+      if (typeof rebuildAllChunks === 'function') rebuildAllChunks();
+    }
+  });
 
   // ─── CONSTANTS ───────────────────────────────────────────────
   var CHUNK_SIZE        = 110;
@@ -218,10 +248,22 @@
         if (onLoad) onLoad(t);
       },
       undefined,
-      function(err) {
-        console.warn('Texture load failed:', key, err);
+      function() {
+        console.warn('Texture load failed:', key);
+        // Create colored placeholder so canvas is never blank
+        var c = document.createElement('canvas');
+        c.width = 64; c.height = 64;
+        var ctx = c.getContext('2d');
+        var hue = hashString(key) % 360;
+        ctx.fillStyle = 'hsl(' + hue + ', 25%, 88%)';
+        ctx.fillRect(0, 0, 64, 64);
+        var fallback = new THREE.CanvasTexture(c);
+        fallback.colorSpace = THREE.SRGBColorSpace;
+        fallback._loaded = true;
+        textureCache.set(key, fallback);
         totalLoaded++;
         updateLoaderProgress();
+        if (onLoad) onLoad(fallback);
       }
     );
     tex._loaded = false;
@@ -253,6 +295,18 @@
       loaderDismissed = true;
       loaderBar.style.transform = 'scaleX(1)';
       loaderEl.classList.add('hidden');
+    }
+    // Check if any real textures loaded
+    var anyLoaded = false;
+    textureCache.forEach(function(tex) {
+      if (tex._loaded) anyLoaded = true;
+    });
+    if (!anyLoaded && MEDIA_MANIFEST.length > 0) {
+      var errDiv = document.createElement('div');
+      errDiv.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.8);color:#fff;padding:12px 20px;border-radius:8px;font-size:13px;z-index:100';
+      errDiv.textContent = 'Images failed to load. Check image URLs and CORS settings.';
+      document.body.appendChild(errDiv);
+      setTimeout(function() { errDiv.style.opacity = '0'; errDiv.style.transition = 'opacity 1s'; }, 8000);
     }
   }, 6000);
 
@@ -341,6 +395,15 @@
     activeChunks.forEach(function(_, key) {
       if (!neededKeys.has(key)) removeChunk(key);
     });
+  }
+
+  function rebuildAllChunks() {
+    activeChunks.forEach(function(_, key) { removeChunk(key); });
+    planeCache.clear();
+    textureCache.clear();
+    totalToLoad = 0;
+    totalLoaded = 0;
+    updateChunks(ctrl.cameraGrid.cx, ctrl.cameraGrid.cy, ctrl.cameraGrid.cz);
   }
 
   // ─── CAMERA CONTROLLER STATE ────────────────────────────────
