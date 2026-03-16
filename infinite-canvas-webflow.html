@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Infinite Canvas | Tiklam</title>
+<style>
+  *,*::after,*::before{box-sizing:border-box}
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;font-family:ui-monospace,monospace;-webkit-font-smoothing:antialiased}
+  body{background:#000;color:#fff}
+
+  #canvas-container{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:grab}
+  #canvas-container.dragging{cursor:grabbing}
+  canvas{display:block;width:100%;height:100%}
+
+  /* Loader overlay */
+  .loader-overlay{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:#fff;transition:opacity .5s ease-out}
+  .loader-overlay.hidden{opacity:0;pointer-events:none}
+  .loader-bar-track{width:200px;height:4px;border-radius:2px;background:rgba(101,82,60,.1);overflow:hidden}
+  .loader-bar-fill{height:100%;width:100%;transform-origin:left;background:rgb(101,82,60);transition:transform .15s ease-out}
+
+  /* Controls hint */
+  .controls-hint{position:absolute;bottom:12px;right:12px;z-index:10;border-radius:8px;background:#fff;padding:12px;color:#000;font-size:11px;box-shadow:0 0 10px rgba(0,0,0,.1);opacity:1;transition:opacity .6s ease-out;pointer-events:none}
+  .controls-hint.fade-out{opacity:0}
+</style>
+</head>
+<body>
+
+<div class="loader-overlay" id="loader">
+  <div class="loader-bar-track">
+    <div class="loader-bar-fill" id="loader-bar" style="transform:scaleX(0)"></div>
+  </div>
+</div>
+
+<div id="canvas-container"></div>
+
+<div class="controls-hint" id="controls-hint"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://esm.sh/three@0.170.0",
+    "three/addons/": "https://esm.sh/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ─── CONFIG ────────────────────────────────────────────────────
+// Replace this array with your own images.
+// Each item needs: url, width, height
+// For Tiklam: use episode thumbnails hosted on a CDN or Webflow assets.
+const MEDIA_MANIFEST = [
+  { url: "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=512&q=80", width: 512, height: 341 },
+  { url: "https://images.unsplash.com/photo-1506748686214-e9df14d4d9d0?w=512&q=80", width: 512, height: 341 },
+  { url: "https://images.unsplash.com/photo-1519681393784-d120267933ba?w=512&q=80", width: 512, height: 341 },
+  { url: "https://images.unsplash.com/photo-1470071459604-3b5ec3a7fe05?w=512&q=80", width: 512, height: 341 },
+  { url: "https://images.unsplash.com/photo-1441974231531-c6227db76b6e?w=512&q=80", width: 512, height: 341 },
+  { url: "https://images.unsplash.com/photo-1518173946687-a2e4c8b6e86c?w=512&q=80", width: 512, height: 341 },
+  { url: "https://images.unsplash.com/photo-1475924156734-496f6cac6ec1?w=512&q=80", width: 512, height: 341 },
+  { url: "https://images.unsplash.com/photo-1501785888041-af3ef285b470?w=512&q=80", width: 512, height: 341 },
+  { url: "https://images.unsplash.com/photo-1472214103451-9374bd1c798e?w=512&q=80", width: 512, height: 341 },
+  { url: "https://images.unsplash.com/photo-1465146344425-f00d5f5c8f07?w=512&q=80", width: 512, height: 341 },
+  { url: "https://images.unsplash.com/photo-1493246507139-91e8fad9978e?w=512&q=80", width: 512, height: 341 },
+  { url: "https://images.unsplash.com/photo-1500534314209-a25ddb2bd429?w=512&q=80", width: 512, height: 341 },
+];
+
+// ─── CONSTANTS ─────────────────────────────────────────────────
+const CHUNK_SIZE       = 110;
+const ITEMS_PER_CHUNK  = 5;
+const RENDER_DISTANCE  = 2;
+const CHUNK_FADE_MARGIN= 1;
+const MAX_VELOCITY     = 3.2;
+const DEPTH_FADE_START = 140;
+const DEPTH_FADE_END   = 260;
+const INVIS_THRESHOLD  = 0.01;
+const KEYBOARD_SPEED   = 0.18;
+const VELOCITY_LERP    = 0.16;
+const VELOCITY_DECAY   = 0.9;
+const INITIAL_CAMERA_Z = 50;
+
+const CAMERA_FOV  = 60;
+const CAMERA_NEAR = 1;
+const CAMERA_FAR  = 500;
+const FOG_NEAR    = 120;
+const FOG_FAR     = 320;
+const BG_COLOR    = '#ffffff';
+const FOG_COLOR   = '#ffffff';
+
+// ─── UTILITIES ─────────────────────────────────────────────────
+const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+const lerp  = (a, b, t) => a + (b - a) * t;
+
+function seededRandom(seed) {
+  const x = Math.sin(seed * 9999) * 10000;
+  return x - Math.floor(x);
+}
+
+function hashString(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = ((h << 5) - h + str.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
+function isTouchDevice() {
+  return ('ontouchstart' in window) || navigator.maxTouchPoints > 0 || (window.matchMedia?.('(pointer: coarse)').matches ?? false);
+}
+
+function getTouchDistance(touches) {
+  if (touches.length < 2) return 0;
+  const dx = touches[0].clientX - touches[1].clientX;
+  const dy = touches[0].clientY - touches[1].clientY;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+// ─── CHUNK OFFSETS (precomputed) ───────────────────────────────
+const maxDist = RENDER_DISTANCE + CHUNK_FADE_MARGIN;
+const CHUNK_OFFSETS = [];
+for (let dx = -maxDist; dx <= maxDist; dx++) {
+  for (let dy = -maxDist; dy <= maxDist; dy++) {
+    for (let dz = -maxDist; dz <= maxDist; dz++) {
+      const dist = Math.max(Math.abs(dx), Math.abs(dy), Math.abs(dz));
+      if (dist <= maxDist) CHUNK_OFFSETS.push({ dx, dy, dz, dist });
+    }
+  }
+}
+
+// ─── PLANE GENERATION (with cache) ────────────────────────────
+const MAX_PLANE_CACHE = 256;
+const planeCache = new Map();
+
+function generateChunkPlanes(cx, cy, cz) {
+  const key = `${cx},${cy},${cz}`;
+  if (planeCache.has(key)) {
+    const v = planeCache.get(key);
+    planeCache.delete(key);
+    planeCache.set(key, v);
+    return v;
+  }
+
+  const seed = hashString(key);
+  const planes = [];
+
+  for (let i = 0; i < ITEMS_PER_CHUNK; i++) {
+    const s = seed + i * 1000;
+    const r = (n) => seededRandom(s + n);
+    const size = 12 + r(4) * 8;
+
+    planes.push({
+      id: `${cx}-${cy}-${cz}-${i}`,
+      px: cx * CHUNK_SIZE + r(0) * CHUNK_SIZE,
+      py: cy * CHUNK_SIZE + r(1) * CHUNK_SIZE,
+      pz: cz * CHUNK_SIZE + r(2) * CHUNK_SIZE,
+      size,
+      mediaIndex: Math.floor(r(5) * 1_000_000),
+    });
+  }
+
+  planeCache.set(key, planes);
+  while (planeCache.size > MAX_PLANE_CACHE) {
+    const firstKey = planeCache.keys().next().value;
+    planeCache.delete(firstKey);
+  }
+
+  return planes;
+}
+
+// ─── TEXTURE MANAGER ──────────────────────────────────────────
+const textureCache = new Map();
+const textureLoader = new THREE.TextureLoader();
+let totalToLoad = 0;
+let totalLoaded = 0;
+
+function getTexture(item, onLoad) {
+  const key = item.url;
+  const existing = textureCache.get(key);
+  if (existing) {
+    if (existing._loaded && onLoad) onLoad(existing);
+    return existing;
+  }
+
+  totalToLoad++;
+  const tex = textureLoader.load(
+    key,
+    (t) => {
+      t.minFilter = THREE.LinearMipmapLinearFilter;
+      t.magFilter = THREE.LinearFilter;
+      t.generateMipmaps = true;
+      t.anisotropy = Math.min(4, renderer.capabilities.getMaxAnisotropy());
+      t.colorSpace = THREE.SRGBColorSpace;
+      t.needsUpdate = true;
+      t._loaded = true;
+      totalLoaded++;
+      updateLoaderProgress();
+      if (onLoad) onLoad(t);
+    },
+    undefined,
+    () => { totalLoaded++; updateLoaderProgress(); }
+  );
+  tex._loaded = false;
+  textureCache.set(key, tex);
+  return tex;
+}
+
+// ─── LOADER ───────────────────────────────────────────────────
+const loaderEl = document.getElementById('loader');
+const loaderBar = document.getElementById('loader-bar');
+let loaderMinTimeElapsed = false;
+let loaderDismissed = false;
+
+setTimeout(() => { loaderMinTimeElapsed = true; }, 1500);
+
+function updateLoaderProgress() {
+  if (loaderDismissed) return;
+  const pct = totalToLoad > 0 ? totalLoaded / totalToLoad : 0;
+  loaderBar.style.transform = `scaleX(${pct})`;
+  if (pct >= 1 && loaderMinTimeElapsed) {
+    loaderDismissed = true;
+    setTimeout(() => { loaderEl.classList.add('hidden'); }, 200);
+  }
+}
+
+// ─── CONTROLS HINT ────────────────────────────────────────────
+const hintEl = document.getElementById('controls-hint');
+hintEl.textContent = isTouchDevice()
+  ? 'اسحب للتنقل · اقرص للتكبير'
+  : 'WASD للتنقل · QE أعلى/أسفل · تمرير للتكبير';
+setTimeout(() => hintEl.classList.add('fade-out'), 5000);
+
+// ─── THREE.JS SETUP ───────────────────────────────────────────
+const container = document.getElementById('canvas-container');
+const isTouch = isTouchDevice();
+const dpr = Math.min(window.devicePixelRatio || 1, isTouch ? 1.25 : 1.5);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(dpr);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(new THREE.Color(BG_COLOR));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+container.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(new THREE.Color(FOG_COLOR), FOG_NEAR, FOG_FAR);
+
+const camera = new THREE.PerspectiveCamera(CAMERA_FOV, window.innerWidth / window.innerHeight, CAMERA_NEAR, CAMERA_FAR);
+camera.position.set(0, 0, INITIAL_CAMERA_Z);
+
+const sharedGeometry = new THREE.PlaneGeometry(1, 1);
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ─── MESH POOL (chunk meshes) ─────────────────────────────────
+// Each chunk's planes are represented by Three.js meshes managed here
+const activeChunks = new Map(); // key -> { meshes: [], planes: [] }
+
+function createPlaneMesh(planeData, mediaItem) {
+  const material = new THREE.MeshBasicMaterial({
+    transparent: true,
+    opacity: 0,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+
+  const mesh = new THREE.Mesh(sharedGeometry, material);
+
+  const aspect = (mediaItem.width && mediaItem.height) ? mediaItem.width / mediaItem.height : 1;
+  mesh.scale.set(planeData.size * aspect, planeData.size, 1);
+  mesh.position.set(planeData.px, planeData.py, planeData.pz);
+  mesh.visible = false;
+
+  mesh._fadeOpacity = 0;
+  mesh._frameCount = 0;
+  mesh._textureReady = false;
+  mesh._chunkCx = 0;
+  mesh._chunkCy = 0;
+  mesh._chunkCz = 0;
+
+  getTexture(mediaItem, (tex) => {
+    material.map = tex;
+    material.needsUpdate = true;
+    mesh._textureReady = true;
+  });
+
+  return mesh;
+}
+
+function addChunk(cx, cy, cz) {
+  const key = `${cx},${cy},${cz}`;
+  if (activeChunks.has(key)) return;
+
+  const planes = generateChunkPlanes(cx, cy, cz);
+  const meshes = [];
+
+  for (const p of planes) {
+    const mediaItem = MEDIA_MANIFEST[p.mediaIndex % MEDIA_MANIFEST.length];
+    if (!mediaItem) continue;
+    const mesh = createPlaneMesh(p, mediaItem);
+    mesh._chunkCx = cx;
+    mesh._chunkCy = cy;
+    mesh._chunkCz = cz;
+    scene.add(mesh);
+    meshes.push(mesh);
+  }
+
+  activeChunks.set(key, { meshes });
+}
+
+function removeChunk(key) {
+  const chunk = activeChunks.get(key);
+  if (!chunk) return;
+  for (const mesh of chunk.meshes) {
+    scene.remove(mesh);
+    mesh.material.dispose();
+  }
+  activeChunks.delete(key);
+}
+
+function updateChunks(cx, cy, cz) {
+  const neededKeys = new Set();
+  for (const o of CHUNK_OFFSETS) {
+    const key = `${cx + o.dx},${cy + o.dy},${cz + o.dz}`;
+    neededKeys.add(key);
+    addChunk(cx + o.dx, cy + o.dy, cz + o.dz);
+  }
+
+  for (const [key] of activeChunks) {
+    if (!neededKeys.has(key)) removeChunk(key);
+  }
+}
+
+// ─── CAMERA CONTROLLER STATE ──────────────────────────────────
+const ctrl = {
+  velocity:   { x: 0, y: 0, z: 0 },
+  targetVel:  { x: 0, y: 0, z: 0 },
+  basePos:    { x: 0, y: 0, z: INITIAL_CAMERA_Z },
+  drift:      { x: 0, y: 0 },
+  mouse:      { x: 0, y: 0 },
+  lastMouse:  { x: 0, y: 0 },
+  scrollAccum: 0,
+  isDragging: false,
+  lastTouches: [],
+  lastTouchDist: 0,
+  lastChunkKey: '',
+  lastChunkUpdate: 0,
+  pendingChunk: null,
+  cameraGrid: { cx: 0, cy: 0, cz: 0 },
+  keys: { forward: false, backward: false, left: false, right: false, up: false, down: false },
+};
+
+// ─── INPUT HANDLERS ───────────────────────────────────────────
+const canvas = renderer.domElement;
+
+canvas.addEventListener('mousedown', (e) => {
+  ctrl.isDragging = true;
+  ctrl.lastMouse = { x: e.clientX, y: e.clientY };
+  container.classList.add('dragging');
+});
+
+window.addEventListener('mouseup', () => {
+  ctrl.isDragging = false;
+  container.classList.remove('dragging');
+});
+
+window.addEventListener('mousemove', (e) => {
+  ctrl.mouse = {
+    x: (e.clientX / window.innerWidth) * 2 - 1,
+    y: -(e.clientY / window.innerHeight) * 2 + 1,
+  };
+  if (ctrl.isDragging) {
+    ctrl.targetVel.x -= (e.clientX - ctrl.lastMouse.x) * 0.025;
+    ctrl.targetVel.y += (e.clientY - ctrl.lastMouse.y) * 0.025;
+    ctrl.lastMouse = { x: e.clientX, y: e.clientY };
+  }
+});
+
+canvas.addEventListener('mouseleave', () => {
+  ctrl.mouse = { x: 0, y: 0 };
+  ctrl.isDragging = false;
+  container.classList.remove('dragging');
+});
+
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  ctrl.scrollAccum += e.deltaY * 0.006;
+}, { passive: false });
+
+canvas.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  ctrl.lastTouches = Array.from(e.touches);
+  ctrl.lastTouchDist = getTouchDistance(ctrl.lastTouches);
+  container.classList.add('dragging');
+}, { passive: false });
+
+canvas.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  const touches = Array.from(e.touches);
+  if (touches.length === 1 && ctrl.lastTouches.length >= 1) {
+    const t = touches[0], lt = ctrl.lastTouches[0];
+    if (t && lt) {
+      ctrl.targetVel.x -= (t.clientX - lt.clientX) * 0.02;
+      ctrl.targetVel.y += (t.clientY - lt.clientY) * 0.02;
+    }
+  } else if (touches.length === 2 && ctrl.lastTouchDist > 0) {
+    const dist = getTouchDistance(touches);
+    ctrl.scrollAccum += (ctrl.lastTouchDist - dist) * 0.006;
+    ctrl.lastTouchDist = dist;
+  }
+  ctrl.lastTouches = touches;
+}, { passive: false });
+
+canvas.addEventListener('touchend', (e) => {
+  ctrl.lastTouches = Array.from(e.touches);
+  ctrl.lastTouchDist = getTouchDistance(ctrl.lastTouches);
+  container.classList.remove('dragging');
+}, { passive: false });
+
+const keyMap = {
+  w: 'forward', W: 'forward', ArrowUp: 'forward',
+  s: 'backward', S: 'backward', ArrowDown: 'backward',
+  a: 'left', A: 'left', ArrowLeft: 'left',
+  d: 'right', D: 'right', ArrowRight: 'right',
+  e: 'up', E: 'up',
+  q: 'down', Q: 'down',
+};
+
+window.addEventListener('keydown', (e) => {
+  const action = keyMap[e.key];
+  if (action) ctrl.keys[action] = true;
+});
+
+window.addEventListener('keyup', (e) => {
+  const action = keyMap[e.key];
+  if (action) ctrl.keys[action] = false;
+});
+
+// ─── INITIAL CHUNKS ───────────────────────────────────────────
+updateChunks(0, 0, 0);
+
+// Force initial progress for loader when no images yet
+setTimeout(() => {
+  if (totalToLoad === 0) {
+    loaderDismissed = true;
+    loaderBar.style.transform = 'scaleX(1)';
+    setTimeout(() => loaderEl.classList.add('hidden'), 200);
+  }
+}, 2000);
+
+// ─── ANIMATION LOOP ───────────────────────────────────────────
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+
+  // Keyboard input
+  if (ctrl.keys.forward)  ctrl.targetVel.z -= KEYBOARD_SPEED;
+  if (ctrl.keys.backward) ctrl.targetVel.z += KEYBOARD_SPEED;
+  if (ctrl.keys.left)     ctrl.targetVel.x -= KEYBOARD_SPEED;
+  if (ctrl.keys.right)    ctrl.targetVel.x += KEYBOARD_SPEED;
+  if (ctrl.keys.down)     ctrl.targetVel.y -= KEYBOARD_SPEED;
+  if (ctrl.keys.up)       ctrl.targetVel.y += KEYBOARD_SPEED;
+
+  // Drift (parallax mouse movement)
+  const isZooming = Math.abs(ctrl.velocity.z) > 0.05;
+  const zoomFactor = clamp(ctrl.basePos.z / 50, 0.3, 2.0);
+  const driftAmount = 8.0 * zoomFactor;
+  const driftLerp = isZooming ? 0.2 : 0.12;
+
+  if (!ctrl.isDragging) {
+    if (isTouch) {
+      ctrl.drift.x = lerp(ctrl.drift.x, 0, driftLerp);
+      ctrl.drift.y = lerp(ctrl.drift.y, 0, driftLerp);
+    } else {
+      ctrl.drift.x = lerp(ctrl.drift.x, ctrl.mouse.x * driftAmount, driftLerp);
+      ctrl.drift.y = lerp(ctrl.drift.y, ctrl.mouse.y * driftAmount, driftLerp);
+    }
+  }
+
+  // Scroll accumulation
+  ctrl.targetVel.z += ctrl.scrollAccum;
+  ctrl.scrollAccum *= 0.8;
+
+  // Clamp & lerp velocity
+  ctrl.targetVel.x = clamp(ctrl.targetVel.x, -MAX_VELOCITY, MAX_VELOCITY);
+  ctrl.targetVel.y = clamp(ctrl.targetVel.y, -MAX_VELOCITY, MAX_VELOCITY);
+  ctrl.targetVel.z = clamp(ctrl.targetVel.z, -MAX_VELOCITY, MAX_VELOCITY);
+
+  ctrl.velocity.x = lerp(ctrl.velocity.x, ctrl.targetVel.x, VELOCITY_LERP);
+  ctrl.velocity.y = lerp(ctrl.velocity.y, ctrl.targetVel.y, VELOCITY_LERP);
+  ctrl.velocity.z = lerp(ctrl.velocity.z, ctrl.targetVel.z, VELOCITY_LERP);
+
+  ctrl.basePos.x += ctrl.velocity.x;
+  ctrl.basePos.y += ctrl.velocity.y;
+  ctrl.basePos.z += ctrl.velocity.z;
+
+  camera.position.set(
+    ctrl.basePos.x + ctrl.drift.x,
+    ctrl.basePos.y + ctrl.drift.y,
+    ctrl.basePos.z
+  );
+
+  ctrl.targetVel.x *= VELOCITY_DECAY;
+  ctrl.targetVel.y *= VELOCITY_DECAY;
+  ctrl.targetVel.z *= VELOCITY_DECAY;
+
+  // Chunk management
+  const cx = Math.floor(ctrl.basePos.x / CHUNK_SIZE);
+  const cy = Math.floor(ctrl.basePos.y / CHUNK_SIZE);
+  const cz = Math.floor(ctrl.basePos.z / CHUNK_SIZE);
+
+  ctrl.cameraGrid = { cx, cy, cz };
+
+  const key = `${cx},${cy},${cz}`;
+  if (key !== ctrl.lastChunkKey) {
+    ctrl.pendingChunk = { cx, cy, cz };
+    ctrl.lastChunkKey = key;
+  }
+
+  const zoomSpeed = Math.abs(ctrl.velocity.z);
+  const throttleMs = zoomSpeed > 1.0 ? 500 : isZooming ? 400 : 100;
+
+  if (ctrl.pendingChunk && (now - ctrl.lastChunkUpdate >= throttleMs)) {
+    updateChunks(ctrl.pendingChunk.cx, ctrl.pendingChunk.cy, ctrl.pendingChunk.cz);
+    ctrl.pendingChunk = null;
+    ctrl.lastChunkUpdate = now;
+  }
+
+  // Per-mesh opacity fade
+  for (const [, chunk] of activeChunks) {
+    for (const mesh of chunk.meshes) {
+      if (!mesh._textureReady) continue;
+
+      mesh._frameCount = (mesh._frameCount + 1) & 1;
+
+      const mat = mesh.material;
+      const opacity = mesh._fadeOpacity;
+
+      if (opacity < INVIS_THRESHOLD && !mesh.visible && mesh._frameCount === 0) continue;
+
+      const chunkDist = Math.max(
+        Math.abs(mesh._chunkCx - cx),
+        Math.abs(mesh._chunkCy - cy),
+        Math.abs(mesh._chunkCz - cz)
+      );
+      const absDepth = Math.abs(mesh.position.z - ctrl.basePos.z);
+
+      if (absDepth > DEPTH_FADE_END + 50) {
+        mesh._fadeOpacity = 0;
+        mat.opacity = 0;
+        mat.depthWrite = false;
+        mesh.visible = false;
+        continue;
+      }
+
+      const gridFade = chunkDist <= RENDER_DISTANCE
+        ? 1
+        : Math.max(0, 1 - (chunkDist - RENDER_DISTANCE) / Math.max(CHUNK_FADE_MARGIN, 0.0001));
+
+      const depthFade = absDepth <= DEPTH_FADE_START
+        ? 1
+        : Math.max(0, 1 - (absDepth - DEPTH_FADE_START) / Math.max(DEPTH_FADE_END - DEPTH_FADE_START, 0.0001));
+
+      const target = Math.min(gridFade, depthFade * depthFade);
+
+      mesh._fadeOpacity = (target < INVIS_THRESHOLD && opacity < INVIS_THRESHOLD)
+        ? 0
+        : lerp(opacity, target, 0.18);
+
+      const isFullyOpaque = mesh._fadeOpacity > 0.99;
+      mat.opacity = isFullyOpaque ? 1 : mesh._fadeOpacity;
+      mat.depthWrite = isFullyOpaque;
+      mesh.visible = mesh._fadeOpacity > INVIS_THRESHOLD;
+    }
+  }
+
+  renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>
